@@ -1,0 +1,15 @@
+{
+  "name": "tagchecker-frontend",
+  "private": true,
+  "version": "0.0.1",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "lint": "echo \"no linter configured\""
+  },
+  "devDependencies": {
+    "vite": "^6.0.0"
+  }
+}

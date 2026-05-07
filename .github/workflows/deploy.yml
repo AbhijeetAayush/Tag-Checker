@@ -1,0 +1,99 @@
+# API: ECR → ECS.
+# Frontend: Vercel (see frontend/vercel.json).
+#
+# GitHub: Secret AWS_ROLE_ARN + vars below. Optional: ALB_BASE_URL for post-deploy curl.
+# Frontend: Vercel (set VITE_API_URL to ALB http(s) URL).
+
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+concurrency:
+  group: deploy-main
+  cancel-in-progress: false
+
+jobs:
+  deploy-api:
+    name: Deploy API (ECR → ECS)
+    runs-on: ubuntu-latest
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      IMAGE_TAG: ${{ github.sha }}
+      ECR_IMAGE: >-
+        ${{ vars.AWS_ACCOUNT_ID }}.dkr.ecr.${{ vars.AWS_REGION }}.amazonaws.com/${{ vars.ECR_REPOSITORY_API }}:${{ github.sha }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build & push image
+        working-directory: backend
+        run: |
+          docker build -t "$ECR_IMAGE" .
+          docker push "$ECR_IMAGE"
+          # Also tag latest on main for manual pulls / task defs still pointing at :latest
+          ECR_REPO="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${{ vars.ECR_REPOSITORY_API }}"
+          docker tag "$ECR_IMAGE" "${ECR_REPO}:latest"
+          docker push "${ECR_REPO}:latest"
+        env:
+          AWS_ACCOUNT_ID: ${{ vars.AWS_ACCOUNT_ID }}
+          AWS_REGION: ${{ vars.AWS_REGION }}
+
+      - name: Render task definition with new image
+        id: render
+        run: |
+          set -euo pipefail
+          FAMILY="${{ vars.ECS_TASK_FAMILY }}"
+          CNAME="${{ vars.CONTAINER_NAME }}"
+          ACCOUNT="${{ vars.AWS_ACCOUNT_ID }}"
+          REGION="${{ vars.AWS_REGION }}"
+          REPO="${{ vars.ECR_REPOSITORY_API }}"
+          TAG="${IMAGE_TAG}"
+
+          test -n "$FAMILY" || { echo "::error::GitHub repo var ECS_TASK_FAMILY is empty"; exit 1; }
+          test -n "$CNAME" || { echo "::error::GitHub repo var CONTAINER_NAME is empty"; exit 1; }
+          test -n "$ACCOUNT" || { echo "::error::GitHub repo var AWS_ACCOUNT_ID is empty"; exit 1; }
+          test -n "$REGION" || { echo "::error::GitHub repo var AWS_REGION is empty"; exit 1; }
+          test -n "$REPO" || { echo "::error::GitHub repo var ECR_REPOSITORY_API is empty"; exit 1; }
+
+          IMG="${ACCOUNT}.dkr.ecr.${REGION}.amazonaws.com/${REPO}:${TAG}"
+
+          aws ecs describe-task-definition \
+            --task-definition "${FAMILY}" \
+            --query taskDefinition \
+            --output json > raw.json
+
+          # Strip read-only keys AWS rejects on RegisterTaskDefinition
+          jq --arg IMG "$IMG" --arg CN "$CNAME" '
+            del(.taskDefinitionArn,.revision,.status,.requiresAttributes,.compatibilities,.registeredAt,.registeredBy,.deregisteredAt) |
+            .containerDefinitions |= map(if .name == $CN then .image = $IMG else . end)
+          ' raw.json > task-definition.json
+
+      - name: Deploy to ECS service
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+        with:
+          task-definition: task-definition.json
+          service: ${{ vars.ECS_SERVICE_API }}
+          cluster: ${{ vars.ECS_CLUSTER }}
+          wait-for-service-stability: true
+
+      - name: Smoke test ALB /health
+        if: ${{ vars.ALB_BASE_URL != '' }}
+        run: |
+          set -euo pipefail
+          curl -sfS "${{ vars.ALB_BASE_URL }}/health" | jq -e '.status == "ok"' >/dev/null
+          echo "ALB smoke test OK"
